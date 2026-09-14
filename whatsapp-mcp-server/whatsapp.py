@@ -1,4 +1,5 @@
 import sqlite3
+import sys
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -75,7 +76,7 @@ def _connect() -> sqlite3.Connection:
         conn.executescript(_CONTACT_VIEWS_SQL)
     except sqlite3.Error as e:
         # No contact store (or it is locked): keep working off the raw chats table.
-        print(f"Contact store unavailable, falling back to chats.name: {e}")
+        print(f"Contact store unavailable, falling back to chats.name: {e}", file=sys.stderr)
     return conn
 
 @dataclass
@@ -153,7 +154,7 @@ def get_sender_name(sender_jid: str) -> str:
             return sender_jid
         
     except sqlite3.Error as e:
-        print(f"Database error while getting sender name: {e}")
+        print(f"Database error while getting sender name: {e}", file=sys.stderr)
         return sender_jid
     finally:
         if 'conn' in locals():
@@ -176,7 +177,7 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
     except Exception as e:
-        print(f"Error formatting message: {e}")
+        print(f"Error formatting message: {e}", file=sys.stderr)
     return output
 
 def format_messages_list(messages: List[Message], show_chat_info: bool = True) -> None:
@@ -284,7 +285,7 @@ def list_messages(
         return format_messages_list(result, show_chat_info=True)    
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         return []
     finally:
         if 'conn' in locals():
@@ -377,7 +378,7 @@ def get_message_context(
         )
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         raise
     finally:
         if 'conn' in locals():
@@ -451,7 +452,7 @@ def list_chats(
         return result
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         return []
     finally:
         if 'conn' in locals():
@@ -488,7 +489,7 @@ def search_contacts(query: str) -> List[Contact]:
         try:
             cursor.execute("""
                 SELECT
-                    COALESCE(m.pn || '@s.whatsapp.net', f.jid) AS jid,
+                    f.jid AS jid,
                     COALESCE(f.full_name, f.first_name, f.push_name, f.business_name) AS name
                 FROM _contacts_flat f
                 LEFT JOIN contacts_db.whatsmeow_lid_map m ON f.jid = m.lid || '@lid'
@@ -502,9 +503,22 @@ def search_contacts(query: str) -> List[Contact]:
         except sqlite3.Error:
             pass  # contact store not attached; chat results are all we have
 
-        # Merge the two sources, preferring a real name over a bare phone number.
+        # The same person can show up under a LID and under a phone number - as a
+        # LID-keyed chat, as a phone-keyed chat, or as either kind of contact row.
+        # Fold every LID onto its phone number so one person is returned once.
+        lid_to_pn = {}
+        try:
+            lid_to_pn = {
+                lid + '@lid': pn + '@s.whatsapp.net'
+                for lid, pn in cursor.execute("SELECT lid, pn FROM contacts_db.whatsmeow_lid_map")
+            }
+        except sqlite3.Error:
+            pass  # contact store not attached; jids stay as they are
+
+        # Merge the sources, preferring a real name over a bare phone number.
         best = {}
         for jid, name in rows:
+            jid = lid_to_pn.get(jid, jid)
             user_part = jid.split('@')[0]
             named = bool(name) and name != user_part
             if jid not in best or (named and not best[jid][1]):
@@ -518,7 +532,7 @@ def search_contacts(query: str) -> List[Contact]:
         return result[:50]
 
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         return []
     finally:
         if 'conn' in locals():
@@ -569,7 +583,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         return result
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         return []
     finally:
         if 'conn' in locals():
@@ -618,7 +632,7 @@ def get_last_interaction(jid: str) -> str:
         return format_message(message)
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         return None
     finally:
         if 'conn' in locals():
@@ -666,7 +680,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         )
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         return None
     finally:
         if 'conn' in locals():
@@ -709,7 +723,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         )
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         return None
     finally:
         if 'conn' in locals():
@@ -840,21 +854,21 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             result = response.json()
             if result.get("success", False):
                 path = result.get("path")
-                print(f"Media downloaded successfully: {path}")
+                print(f"Media downloaded successfully: {path}", file=sys.stderr)
                 return path
             else:
-                print(f"Download failed: {result.get('message', 'Unknown error')}")
+                print(f"Download failed: {result.get('message', 'Unknown error')}", file=sys.stderr)
                 return None
         else:
-            print(f"Error: HTTP {response.status_code} - {response.text}")
+            print(f"Error: HTTP {response.status_code} - {response.text}", file=sys.stderr)
             return None
             
     except requests.RequestException as e:
-        print(f"Request error: {str(e)}")
+        print(f"Request error: {str(e)}", file=sys.stderr)
         return None
     except json.JSONDecodeError:
-        print(f"Error parsing response: {response.text}")
+        print(f"Error parsing response: {response.text}", file=sys.stderr)
         return None
     except Exception as e:
-        print(f"Unexpected error: {str(e)}")
+        print(f"Unexpected error: {str(e)}", file=sys.stderr)
         return None
