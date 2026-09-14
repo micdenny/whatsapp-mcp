@@ -272,3 +272,88 @@ func TestGetHistoryAnchor(t *testing.T) {
 		}
 	})
 }
+
+func TestExtractsDocumentSentWithACaption(t *testing.T) {
+	// A PDF sent with a message body arrives wrapped in
+	// DocumentWithCaptionMessage. Before it was unwrapped both the text and
+	// the media came back empty and the whole message was dropped on the
+	// floor, taking the attachment with it.
+	const (
+		caption    = "Buonasera, mi scuso per il ritardo.\nCONVOCAZIONI PER DOMANI gara torneo della bassa parmense."
+		directPath = "/v/t62.7119-24/convocazione_n.enc?ccb=11-4&oh=abc"
+	)
+
+	msg := &waProto.Message{
+		DocumentWithCaptionMessage: &waProto.FutureProofMessage{
+			Message: &waProto.Message{
+				DocumentMessage: &waProto.DocumentMessage{
+					URL:        proto.String("https://mmg.whatsapp.net" + directPath + "&mms3=true"),
+					DirectPath: proto.String(directPath),
+					FileName:   proto.String("Convocazioni U9.pdf"),
+					Caption:    proto.String(caption),
+				},
+			},
+		},
+	}
+
+	if got := extractTextContent(msg); got != caption {
+		t.Errorf("extractTextContent() = %q, want the caption", got)
+	}
+
+	mediaType, filename, _, gotDirectPath, _, _, _, _ := extractMediaInfo(msg)
+	if mediaType != "document" {
+		t.Errorf("mediaType = %q, want document", mediaType)
+	}
+	if filename != "Convocazioni U9.pdf" {
+		t.Errorf("filename = %q, want the document's name", filename)
+	}
+	if gotDirectPath != directPath {
+		t.Errorf("directPath = %q, want %q", gotDirectPath, directPath)
+	}
+}
+
+func TestUnwrapMessageEnvelopes(t *testing.T) {
+	image := &waProto.Message{ImageMessage: &waProto.ImageMessage{
+		Caption: proto.String("foto della distinta"),
+	}}
+
+	tests := []struct {
+		name string
+		msg  *waProto.Message
+	}{
+		{"view once", &waProto.Message{ViewOnceMessage: &waProto.FutureProofMessage{Message: image}}},
+		{"view once v2", &waProto.Message{ViewOnceMessageV2: &waProto.FutureProofMessage{Message: image}}},
+		{"ephemeral", &waProto.Message{EphemeralMessage: &waProto.FutureProofMessage{Message: image}}},
+		{
+			"ephemeral wrapping view once",
+			&waProto.Message{EphemeralMessage: &waProto.FutureProofMessage{
+				Message: &waProto.Message{ViewOnceMessageV2: &waProto.FutureProofMessage{Message: image}},
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if mediaType, _, _, _, _, _, _, _ := extractMediaInfo(tt.msg); mediaType != "image" {
+				t.Errorf("mediaType = %q, want image", mediaType)
+			}
+			if got := extractTextContent(tt.msg); got != "foto della distinta" {
+				t.Errorf("extractTextContent() = %q, want the caption", got)
+			}
+		})
+	}
+}
+
+func TestUnwrapMessageStopsOnSelfReference(t *testing.T) {
+	loop := &waProto.Message{}
+	loop.EphemeralMessage = &waProto.FutureProofMessage{Message: loop}
+
+	done := make(chan *waProto.Message, 1)
+	go func() { done <- unwrapMessage(loop) }()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("unwrapMessage did not terminate on a self-referencing envelope")
+	}
+}

@@ -180,11 +180,46 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
+// Unwrap the envelopes WhatsApp puts around a payload. A document sent with a
+// caption arrives as DocumentWithCaptionMessage, and disappearing or view-once
+// messages are nested the same way, so the media and text live one level down.
+func unwrapMessage(msg *waProto.Message) *waProto.Message {
+	for range maxMessageNesting {
+		var inner *waProto.Message
+
+		switch {
+		case msg.GetDocumentWithCaptionMessage() != nil:
+			inner = msg.GetDocumentWithCaptionMessage().GetMessage()
+		case msg.GetEphemeralMessage() != nil:
+			inner = msg.GetEphemeralMessage().GetMessage()
+		case msg.GetViewOnceMessage() != nil:
+			inner = msg.GetViewOnceMessage().GetMessage()
+		case msg.GetViewOnceMessageV2() != nil:
+			inner = msg.GetViewOnceMessageV2().GetMessage()
+		case msg.GetViewOnceMessageV2Extension() != nil:
+			inner = msg.GetViewOnceMessageV2Extension().GetMessage()
+		}
+
+		if inner == nil {
+			break
+		}
+		msg = inner
+	}
+
+	return msg
+}
+
+// Envelopes can nest (a view-once document with a caption inside a
+// disappearing message), but not without bound
+const maxMessageNesting = 4
+
 // Extract text content from a message
 func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {
 		return ""
 	}
+
+	msg = unwrapMessage(msg)
 
 	// Try to get text content
 	if text := msg.GetConversation(); text != "" {
@@ -193,7 +228,15 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// A caption is the message text for anything sent with an attachment
+	if caption := msg.GetDocumentMessage().GetCaption(); caption != "" {
+		return caption
+	} else if caption := msg.GetImageMessage().GetCaption(); caption != "" {
+		return caption
+	} else if caption := msg.GetVideoMessage().GetCaption(); caption != "" {
+		return caption
+	}
+
 	return ""
 }
 
@@ -384,6 +427,8 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	if msg == nil {
 		return "", "", "", "", nil, nil, nil, 0
 	}
+
+	msg = unwrapMessage(msg)
 
 	// Check for image message
 	if img := msg.GetImageMessage(); img != nil {
