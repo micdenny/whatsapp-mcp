@@ -198,3 +198,77 @@ func TestNewMessageStoreMigratesLegacySchema(t *testing.T) {
 		t.Errorf("fallback direct path = %q, want %q", got, want)
 	}
 }
+
+func TestGetHistoryAnchor(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	store, err := NewMessageStore()
+	if err != nil {
+		t.Fatalf("NewMessageStore() = %v", err)
+	}
+	defer store.Close()
+
+	const chat = "120363315193425422@g.us"
+	if err := store.StoreChat(chat, "GENITORI PC U9", time.Now()); err != nil {
+		t.Fatalf("StoreChat() = %v", err)
+	}
+
+	// The store as it looked around the missing 12/09 convocation: a gap sits
+	// between the evening of the 12th and the morning of the 13th.
+	seed := []struct {
+		id       string
+		ts       string
+		isFromMe bool
+	}{
+		{"OLDEST", "2026-06-19T15:42:15Z", false},
+		{"BEFOREGAP", "2026-09-12T18:50:18Z", false},
+		{"AFTERGAP", "2026-09-13T09:02:50Z", true},
+	}
+	for _, s := range seed {
+		ts, err := time.Parse(time.RFC3339, s.ts)
+		if err != nil {
+			t.Fatalf("parse %s = %v", s.ts, err)
+		}
+		if err := store.StoreMessage(s.id, chat, "someone", "testo", ts, s.isFromMe, "", "", "", "", nil, nil, nil, 0); err != nil {
+			t.Fatalf("StoreMessage(%s) = %v", s.id, err)
+		}
+	}
+
+	t.Run("defaults to the oldest message", func(t *testing.T) {
+		anchor, err := store.GetHistoryAnchor(chat, "")
+		if err != nil {
+			t.Fatalf("GetHistoryAnchor() = %v", err)
+		}
+		if anchor.ID != "OLDEST" {
+			t.Errorf("anchor = %q, want OLDEST", anchor.ID)
+		}
+	})
+
+	t.Run("anchors on the requested message to fill a gap", func(t *testing.T) {
+		anchor, err := store.GetHistoryAnchor(chat, "AFTERGAP")
+		if err != nil {
+			t.Fatalf("GetHistoryAnchor() = %v", err)
+		}
+		if anchor.ID != "AFTERGAP" {
+			t.Errorf("anchor = %q, want AFTERGAP", anchor.ID)
+		}
+		if !anchor.IsFromMe {
+			t.Error("IsFromMe = false, want true: the request tells the phone which side sent the anchor")
+		}
+		if want := "2026-09-13 09:02:50"; anchor.Timestamp.UTC().Format("2006-01-02 15:04:05") != want {
+			t.Errorf("timestamp = %v, want %s", anchor.Timestamp.UTC(), want)
+		}
+	})
+
+	t.Run("unknown message", func(t *testing.T) {
+		if _, err := store.GetHistoryAnchor(chat, "NOPE"); err == nil {
+			t.Error("GetHistoryAnchor() = nil error, want a not-found error")
+		}
+	})
+
+	t.Run("chat with no messages", func(t *testing.T) {
+		if _, err := store.GetHistoryAnchor("120363999999999999@g.us", ""); err == nil {
+			t.Error("GetHistoryAnchor() = nil error, want a not-found error")
+		}
+	})
+}

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -484,6 +485,23 @@ type DownloadMediaRequest struct {
 	ChatJID   string `json:"chat_jid"`
 }
 
+// WhatsApp's recommended batch size for an on-demand history request
+const defaultHistorySyncCount = 50
+
+// HistorySyncRequest represents the request body for the history backfill API
+type HistorySyncRequest struct {
+	ChatJID         string `json:"chat_jid"`
+	BeforeMessageID string `json:"before_message_id,omitempty"`
+	Count           int    `json:"count,omitempty"`
+}
+
+// HistorySyncResponse represents the response for the history backfill API
+type HistorySyncResponse struct {
+	Success bool          `json:"success"`
+	Message string        `json:"message"`
+	Anchor  HistoryAnchor `json:"anchor,omitempty"`
+}
+
 // DownloadMediaResponse represents the response for the download media API
 type DownloadMediaResponse struct {
 	Success  bool   `json:"success"`
@@ -499,6 +517,37 @@ func (store *MessageStore) StoreMediaInfo(id, chatJID, url, directPath string, m
 		url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength, id, chatJID,
 	)
 	return err
+}
+
+// HistoryAnchor is the message a history sync request counts backwards from
+type HistoryAnchor struct {
+	ID        string    `json:"message_id"`
+	IsFromMe  bool      `json:"is_from_me"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// Pick the message a backfill should count backwards from. Given a message ID,
+// that message is used; otherwise the oldest one the chat has, which extends
+// the stored history further back. Passing an ID is how an interior gap gets
+// filled: anchor on the first message after the hole.
+func (store *MessageStore) GetHistoryAnchor(chatJID, messageID string) (HistoryAnchor, error) {
+	query := "SELECT id, is_from_me, timestamp FROM messages WHERE chat_jid = ? ORDER BY timestamp ASC LIMIT 1"
+	args := []any{chatJID}
+	if messageID != "" {
+		query = "SELECT id, is_from_me, timestamp FROM messages WHERE chat_jid = ? AND id = ?"
+		args = append(args, messageID)
+	}
+
+	var anchor HistoryAnchor
+	err := store.db.QueryRow(query, args...).Scan(&anchor.ID, &anchor.IsFromMe, &anchor.Timestamp)
+	if errors.Is(err, sql.ErrNoRows) {
+		if messageID != "" {
+			return anchor, fmt.Errorf("message %s not found in chat %s", messageID, chatJID)
+		}
+		return anchor, fmt.Errorf("no messages stored for chat %s: nothing to anchor a backfill on", chatJID)
+	}
+
+	return anchor, err
 }
 
 // Get media info from the database
@@ -787,6 +836,49 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
 			Filename: filename,
 			Path:     path,
+		})
+	})
+
+	// Handler for backfilling older history in a chat
+	http.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req HistorySyncRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.ChatJID == "" {
+			http.Error(w, "Chat JID is required", http.StatusBadRequest)
+			return
+		}
+
+		if req.Count <= 0 {
+			req.Count = defaultHistorySyncCount
+		}
+
+		anchor, err := requestHistorySync(r.Context(), client, messageStore, req.ChatJID, req.BeforeMessageID, req.Count)
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(HistorySyncResponse{
+				Success: false,
+				Message: err.Error(),
+			})
+			return
+		}
+
+		json.NewEncoder(w).Encode(HistorySyncResponse{
+			Success: true,
+			Message: fmt.Sprintf("Requested %d messages before %s. The reply is asynchronous: poll the chat again shortly.",
+				req.Count, anchor.Timestamp.Format("2006-01-02 15:04:05")),
+			Anchor: anchor,
 		})
 	})
 
@@ -1193,40 +1285,42 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
 }
 
-// Request history sync from the server
-func requestHistorySync(client *whatsmeow.Client) {
-	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
-		return
-	}
-
-	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
-		return
+// Ask the primary device for the messages that precede an anchor already in
+// the store. The reply arrives asynchronously as an ON_DEMAND events.HistorySync
+// and is persisted by handleHistorySync.
+func requestHistorySync(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, chatJID, beforeMessageID string, count int) (HistoryAnchor, error) {
+	if client == nil || !client.IsConnected() {
+		return HistoryAnchor{}, fmt.Errorf("not connected to WhatsApp")
 	}
 
 	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
-		return
+		return HistoryAnchor{}, fmt.Errorf("not logged in")
 	}
 
-	// Build and send a history sync request
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
-	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
-		return
-	}
-
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
-
+	jid, err := types.ParseJID(chatJID)
 	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
-	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
+		return HistoryAnchor{}, fmt.Errorf("invalid chat JID %q: %v", chatJID, err)
 	}
+
+	anchor, err := messageStore.GetHistoryAnchor(chatJID, beforeMessageID)
+	if err != nil {
+		return HistoryAnchor{}, err
+	}
+
+	historyMsg := client.BuildHistorySyncRequest(&types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: jid, IsFromMe: anchor.IsFromMe},
+		ID:            anchor.ID,
+		Timestamp:     anchor.Timestamp,
+	}, count)
+	if historyMsg == nil {
+		return HistoryAnchor{}, fmt.Errorf("failed to build history sync request")
+	}
+
+	if _, err := client.SendPeerMessage(ctx, historyMsg); err != nil {
+		return HistoryAnchor{}, fmt.Errorf("failed to request history sync: %v", err)
+	}
+
+	return anchor, nil
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file
