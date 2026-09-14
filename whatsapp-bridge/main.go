@@ -929,15 +929,39 @@ func main() {
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
+// isBareJIDUser reports whether s looks like a JID user part rather than a name:
+// digits, optionally with the "-<timestamp>" of a legacy group JID or a ":<device>"
+// suffix. Contact names are never shaped like this, so such a value can only be a
+// fallback we stored when no name was available yet.
+func isBareJIDUser(s string) bool {
+	if s == "" {
+		return false
+	}
+	digits := false
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			digits = true
+		case r == '-' || r == ':' || r == '.':
+			// separators used inside JID user parts
+		default:
+			return false
+		}
+	}
+	return digits
+}
+
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	// A stored name that is just the JID user part (or "Group <user>") is not a real
+	// A stored name that is only a JID user part (or "Group <user>") is not a real
 	// name: it is the fallback we used because the contact/group info had not synced
-	// yet when the chat was first stored. Re-resolve those instead of keeping the bare
-	// phone number as the chat name forever.
-	isPlaceholder := existingName == jid.User || existingName == fmt.Sprintf("Group %s", jid.User)
+	// yet when the chat was first stored. Re-resolve those instead of keeping a bare
+	// number as the chat name forever. Note the stored number is not necessarily
+	// jid.User - for a chat first seen through an outgoing message it is the sender's
+	// own LID - so test the shape of the name rather than comparing it to this JID.
+	isPlaceholder := isBareJIDUser(existingName) || existingName == fmt.Sprintf("Group %s", jid.User)
 	if err == nil && existingName != "" && !isPlaceholder {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
