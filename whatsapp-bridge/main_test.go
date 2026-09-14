@@ -27,3 +27,37 @@ func TestIsBareJIDUser(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractDirectPathFromURL(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			"keeps the query string",
+			"https://mmg.whatsapp.net/v/t62.7119-24/802309742_1113672974664032_288117231437204654_n.enc?ccb=11-4&oh=01_Q5Aa5gFv&oe=6ACB3A24&_nc_sid=5e03e0&mms3=true",
+			"/v/t62.7119-24/802309742_1113672974664032_288117231437204654_n.enc?ccb=11-4&oh=01_Q5Aa5gFv&oe=6ACB3A24&_nc_sid=5e03e0&mms3=true",
+		},
+		{
+			"no query string",
+			"https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_n.enc",
+			"/v/t62.7118-24/13812002_698058036224062_n.enc",
+		},
+		{
+			"host outside .net",
+			"https://media-mxp1-1.cdn.whatsapp.com/v/t62.7118-24/file.enc?ccb=11-4",
+			"/v/t62.7118-24/file.enc?ccb=11-4",
+		},
+		{"already a direct path", "/v/t62.7118-24/file.enc?ccb=11-4", "/v/t62.7118-24/file.enc?ccb=11-4"},
+		{"no path", "https://mmg.whatsapp.net", "https://mmg.whatsapp.net"},
+		{"empty", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := extractDirectPathFromURL(tt.in); got != tt.want {
+				t.Errorf("extractDirectPathFromURL(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
