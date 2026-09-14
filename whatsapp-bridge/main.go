@@ -933,7 +933,12 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
+	// A stored name that is just the JID user part (or "Group <user>") is not a real
+	// name: it is the fallback we used because the contact/group info had not synced
+	// yet when the chat was first stored. Re-resolve those instead of keeping the bare
+	// phone number as the chat name forever.
+	isPlaceholder := existingName == jid.User || existingName == fmt.Sprintf("Group %s", jid.User)
+	if err == nil && existingName != "" && !isPlaceholder {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
