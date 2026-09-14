@@ -7,6 +7,7 @@ import (
 	"time"
 
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -355,5 +356,79 @@ func TestUnwrapMessageStopsOnSelfReference(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("unwrapMessage did not terminate on a self-referencing envelope")
+	}
+}
+
+func TestResolveEditRedirectsToTheOriginalMessage(t *testing.T) {
+	const (
+		originalID = "ACC679F768FE34BA29B619336BDFA56F"
+		editID     = "EDIT123"
+		newCaption = "CONVOCAZIONI PER DOMANI gara torneo della bassa parmense."
+		directPath = "/v/t62.7119-24/convocazione_n.enc?ccb=11-4&oh=abc"
+	)
+
+	edit := &waProto.Message{
+		ProtocolMessage: &waProto.ProtocolMessage{
+			Type: waProto.ProtocolMessage_MESSAGE_EDIT.Enum(),
+			Key:  &waCommon.MessageKey{ID: proto.String(originalID)},
+			EditedMessage: &waProto.Message{
+				DocumentWithCaptionMessage: &waProto.FutureProofMessage{
+					Message: &waProto.Message{
+						DocumentMessage: &waProto.DocumentMessage{
+							URL:        proto.String("https://mmg.whatsapp.net" + directPath + "&mms3=true"),
+							DirectPath: proto.String(directPath),
+							FileName:   proto.String("Modulo convocazioni.pdf"),
+							Caption:    proto.String(newCaption),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	payload, gotID := resolveEdit(edit, editID)
+	if gotID != originalID {
+		t.Errorf("message ID = %q, want the edited message's ID %q", gotID, originalID)
+	}
+	if got := extractTextContent(payload); got != newCaption {
+		t.Errorf("extractTextContent() = %q, want the new caption", got)
+	}
+	if mediaType, filename, _, _, _, _, _, _ := extractMediaInfo(payload); mediaType != "document" || filename != "Modulo convocazioni.pdf" {
+		t.Errorf("media = %q/%q, want document/Modulo convocazioni.pdf", mediaType, filename)
+	}
+}
+
+func TestResolveEditLeavesOtherMessagesAlone(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  *waProto.Message
+	}{
+		{"plain text", &waProto.Message{Conversation: proto.String("ciao")}},
+		{
+			"a protocol message that is not an edit",
+			&waProto.Message{ProtocolMessage: &waProto.ProtocolMessage{
+				Type: waProto.ProtocolMessage_REVOKE.Enum(),
+				Key:  &waCommon.MessageKey{ID: proto.String("OTHER")},
+			}},
+		},
+		{
+			"an edit with no replacement content",
+			&waProto.Message{ProtocolMessage: &waProto.ProtocolMessage{
+				Type: waProto.ProtocolMessage_MESSAGE_EDIT.Enum(),
+				Key:  &waCommon.MessageKey{ID: proto.String("OTHER")},
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload, gotID := resolveEdit(tt.msg, "ORIGINAL")
+			if gotID != "ORIGINAL" {
+				t.Errorf("message ID = %q, want it untouched", gotID)
+			}
+			if payload != tt.msg {
+				t.Error("payload was replaced, want the message returned as-is")
+			}
+		})
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // Message represents a chat message for our client
@@ -212,6 +214,44 @@ func unwrapMessage(msg *waProto.Message) *waProto.Message {
 // Envelopes can nest (a view-once document with a caption inside a
 // disappearing message), but not without bound
 const maxMessageNesting = 4
+
+// An edit does not arrive as a new message: it is a ProtocolMessage naming the
+// message it replaces, with the new content inside. Return that content and the
+// ID it belongs to, so the edit updates the original row instead of being
+// dropped for looking like an empty message.
+func resolveEdit(msg *waProto.Message, messageID string) (*waProto.Message, string) {
+	protocolMsg := msg.GetProtocolMessage()
+	if protocolMsg.GetType() != waProto.ProtocolMessage_MESSAGE_EDIT || protocolMsg.GetEditedMessage() == nil {
+		return msg, messageID
+	}
+
+	if editedID := protocolMsg.GetKey().GetID(); editedID != "" {
+		messageID = editedID
+	}
+
+	return protocolMsg.GetEditedMessage(), messageID
+}
+
+// Name the protobuf fields a message actually carries, so a shape we do not
+// yet understand can be identified instead of vanishing without trace.
+func populatedFields(msg *waProto.Message) string {
+	if msg == nil {
+		return "nothing"
+	}
+
+	var names []string
+	msg.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		names = append(names, string(fd.Name()))
+		return true
+	})
+
+	if len(names) == 0 {
+		return "nothing"
+	}
+
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
 
 // Extract text content from a message
 func extractTextContent(msg *waProto.Message) string {
@@ -476,20 +516,23 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		logger.Warnf("Failed to store chat: %v", err)
 	}
 
+	payload, messageID := resolveEdit(msg.Message, msg.Info.ID)
+
 	// Extract text content
-	content := extractTextContent(msg.Message)
+	content := extractTextContent(payload)
 
 	// Extract media info
-	mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+	mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(payload)
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
+		logger.Warnf("Dropping message in %s carrying only: %s", chatJID, populatedFields(payload))
 		return
 	}
 
 	// Store message in database
 	err = messageStore.StoreMessage(
-		msg.Info.ID,
+		messageID,
 		chatJID,
 		sender,
 		content,
@@ -1235,16 +1278,22 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
+				editedID := ""
+				if msg.Message.Key != nil {
+					editedID = msg.Message.Key.GetID()
+				}
+				payload, editedID := resolveEdit(msg.Message.Message, editedID)
+
 				// Extract text content
-				content := extractTextContent(msg.Message.Message)
+				content := extractTextContent(payload)
 
 				// Extract media info
 				var mediaType, filename, url, directPath string
 				var mediaKey, fileSHA256, fileEncSHA256 []byte
 				var fileLength uint64
 
-				if msg.Message.Message != nil {
-					mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
+				if payload != nil {
+					mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(payload)
 				}
 
 				// Log the message content for debugging
@@ -1252,6 +1301,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
+					logger.Warnf("Dropping history message in %s carrying only: %s",
+						chatJID, populatedFields(payload))
 					continue
 				}
 
@@ -1273,11 +1324,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					sender = jid.User
 				}
 
-				// Store message
-				msgID := ""
-				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
-					msgID = *msg.Message.Key.ID
-				}
+				// Store message under the edited message's ID when this is an edit
+				msgID := editedID
 
 				// Get message timestamp
 				timestamp := time.Time{}
