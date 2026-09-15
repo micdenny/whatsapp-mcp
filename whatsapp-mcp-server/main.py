@@ -12,7 +12,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    request_history as whatsapp_request_history
 )
 
 # Initialize FastMCP server
@@ -245,6 +246,38 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def request_history(
+    chat_jid: str,
+    before_message_id: str | None = None,
+    before_date: str | None = None,
+    count: int = 50,
+    wait_seconds: int = 60
+) -> Dict[str, Any]:
+    """Ask the phone for older messages in a chat, and wait for them to arrive.
+
+    The store only holds what WhatsApp happened to sync, so a chat can be short
+    of history or missing a stretch in the middle. This asks the primary device
+    for the messages immediately before an anchor and waits for the reply.
+
+    Args:
+        chat_jid: The JID of the chat to backfill
+        before_message_id: Anchor: fetch the messages preceding this one
+        before_date: Anchor by time instead (e.g. '2026-09-13'), resolved to the
+            first message at or after it. Use it to fill a gap in the middle of a
+            chat, anchoring just after the hole. Ignored if before_message_id is given
+        count: How many messages to ask for (WhatsApp recommends 50)
+        wait_seconds: How long to wait for the reply before giving up on it
+
+    Returns:
+        A dictionary with the anchor used, how many messages were stored, and how
+        far back the chat now reaches. Without either anchor, the chat's oldest
+        message is used and its history grows further back.
+    """
+    return whatsapp_request_history(
+        chat_jid, before_message_id, before_date, count, wait_seconds
+    )
 
 if __name__ == "__main__":
     # Initialize and run the server

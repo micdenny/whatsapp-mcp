@@ -2,11 +2,12 @@ import sqlite3
 import sys
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 import os.path
 from pathlib import Path
 import requests
 import json
+import time
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
@@ -872,3 +873,102 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}", file=sys.stderr)
         return None
+
+
+def _chat_snapshot(chat_jid: str) -> Tuple[int, Optional[str]]:
+    """Return how many messages a chat holds and its oldest timestamp."""
+    conn = _connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*), MIN(timestamp) FROM messages WHERE chat_jid = ?",
+            (chat_jid,),
+        )
+        total, oldest = cursor.fetchone()
+        return total or 0, oldest
+    finally:
+        conn.close()
+
+
+def _resolve_anchor_by_date(chat_jid: str, before_date: str) -> Optional[str]:
+    """Find the first message at or after before_date, to backfill what precedes it."""
+    conn = _connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """SELECT id FROM messages
+               WHERE chat_jid = ? AND timestamp >= ?
+               ORDER BY timestamp ASC LIMIT 1""",
+            (chat_jid, before_date),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def request_history(
+    chat_jid: str,
+    before_message_id: Optional[str] = None,
+    before_date: Optional[str] = None,
+    count: int = 50,
+    wait_seconds: int = 60,
+) -> Dict[str, Any]:
+    """Ask the phone for older messages in a chat and wait for them to land."""
+    if before_date and not before_message_id:
+        before_message_id = _resolve_anchor_by_date(chat_jid, before_date)
+        if not before_message_id:
+            return {
+                "success": False,
+                "message": (
+                    f"No message stored at or after {before_date} in {chat_jid}, "
+                    "so there is nothing to anchor the request on"
+                ),
+            }
+
+    before_total, before_oldest = _chat_snapshot(chat_jid)
+
+    payload: Dict[str, Any] = {"chat_jid": chat_jid, "count": count}
+    if before_message_id:
+        payload["before_message_id"] = before_message_id
+
+    try:
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/history", json=payload, timeout=30)
+        result = response.json()
+    except requests.RequestException as e:
+        return {"success": False, "message": f"Request error: {e}"}
+    except json.JSONDecodeError:
+        return {"success": False, "message": f"Error parsing response: {response.text}"}
+
+    if not result.get("success"):
+        return {"success": False, "message": result.get("message", "Unknown error")}
+
+    anchor = result.get("anchor", {})
+
+    # WhatsApp answers asynchronously, so watch the store until the batch lands.
+    deadline = time.monotonic() + max(0, wait_seconds)
+    added, oldest = 0, before_oldest
+    while time.monotonic() < deadline:
+        time.sleep(2)
+        total, oldest = _chat_snapshot(chat_jid)
+        added = total - before_total
+        if added > 0:
+            break
+
+    if added > 0:
+        message = f"{added} new message(s) stored"
+        if oldest and oldest != before_oldest:
+            message += f"; the chat now reaches back to {oldest}"
+    else:
+        message = (
+            f"No new messages after waiting {wait_seconds}s. The phone may have "
+            "returned only messages already stored, or may still be replying"
+        )
+
+    return {
+        "success": True,
+        "message": message,
+        "anchor": anchor,
+        "messages_added": added,
+        "oldest_message": oldest,
+    }
