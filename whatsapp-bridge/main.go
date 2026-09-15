@@ -110,7 +110,18 @@ func (store *MessageStore) Close() error {
 
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
-	_, err := store.db.Exec(
+	// A history backfill delivers older messages, so its timestamp must never
+	// drag the chat backwards in a list ordered by last activity.
+	var existing time.Time
+	err := store.db.QueryRow("SELECT last_message_time FROM chats WHERE jid = ?", jid).Scan(&existing)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if existing.After(lastMessageTime) {
+		lastMessageTime = existing
+	}
+
+	_, err = store.db.Exec(
 		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
 		jid, name, lastMessageTime,
 	)

@@ -432,3 +432,42 @@ func TestResolveEditLeavesOtherMessagesAlone(t *testing.T) {
 		})
 	}
 }
+
+func TestStoreChatNeverMovesLastActivityBackwards(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	store, err := NewMessageStore()
+	if err != nil {
+		t.Fatalf("NewMessageStore() = %v", err)
+	}
+	defer store.Close()
+
+	const jid = "120363315193425422@g.us"
+	latest := time.Date(2026, 9, 14, 20, 28, 23, 0, time.UTC)
+	if err := store.StoreChat(jid, "GENITORI PC U9", latest); err != nil {
+		t.Fatalf("StoreChat() = %v", err)
+	}
+
+	// What a backfill looks like: a batch of older history arriving later.
+	older := time.Date(2026, 6, 30, 20, 42, 12, 0, time.UTC)
+	if err := store.StoreChat(jid, "GENITORI PC U9", older); err != nil {
+		t.Fatalf("StoreChat() with older batch = %v", err)
+	}
+
+	chats, err := store.GetChats()
+	if err != nil {
+		t.Fatalf("GetChats() = %v", err)
+	}
+	if got := chats[jid]; !got.Equal(latest) {
+		t.Errorf("last activity = %v, want it kept at %v", got, latest)
+	}
+
+	newer := time.Date(2026, 9, 15, 8, 0, 0, 0, time.UTC)
+	if err := store.StoreChat(jid, "GENITORI PC U9", newer); err != nil {
+		t.Fatalf("StoreChat() with newer message = %v", err)
+	}
+	chats, _ = store.GetChats()
+	if got := chats[jid]; !got.Equal(newer) {
+		t.Errorf("last activity = %v, want it advanced to %v", got, newer)
+	}
+}
