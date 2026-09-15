@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -97,6 +98,7 @@ func TestExtractMediaInfoKeepsProtobufDirectPath(t *testing.T) {
 				DirectPath: proto.String(directPath),
 			}},
 			"image",
+			// Images carry no filename of their own; downloadMedia names them.
 			"",
 		},
 	}
@@ -107,7 +109,7 @@ func TestExtractMediaInfoKeepsProtobufDirectPath(t *testing.T) {
 			if mediaType != tt.wantType {
 				t.Errorf("mediaType = %q, want %q", mediaType, tt.wantType)
 			}
-			if tt.wantFilename != "" && filename != tt.wantFilename {
+			if filename != tt.wantFilename {
 				t.Errorf("filename = %q, want %q", filename, tt.wantFilename)
 			}
 			if gotDirectPath != directPath {
@@ -469,5 +471,100 @@ func TestStoreChatNeverMovesLastActivityBackwards(t *testing.T) {
 	chats, _ = store.GetChats()
 	if got := chats[jid]; !got.Equal(newer) {
 		t.Errorf("last activity = %v, want it advanced to %v", got, newer)
+	}
+}
+
+func TestMediaNamesSurviveAHistorySyncBurst(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	store, err := NewMessageStore()
+	if err != nil {
+		t.Fatalf("NewMessageStore() = %v", err)
+	}
+	defer store.Close()
+
+	const chat = "120363402072157374@g.us"
+	if err := store.StoreChat(chat, "2016 - Pulcini Saranno Campioni", time.Now()); err != nil {
+		t.Fatalf("StoreChat() = %v", err)
+	}
+
+	// Two different images from the same batch: a history sync ingests them
+	// within the same second, so anything clock-derived collides.
+	ingestedAt := time.Date(2026, 9, 14, 12, 38, 0, 0, time.UTC)
+	images := []struct {
+		id  string
+		sha []byte
+	}{
+		{"3A9F1C2B4D5E6F708192", []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa}},
+		{"3A9F1C2B4D5E6F708193", []byte{0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11}},
+	}
+
+	names := make(map[string]string, len(images))
+	for _, img := range images {
+		msg := &waProto.Message{ImageMessage: &waProto.ImageMessage{
+			URL:        proto.String("https://mmg.whatsapp.net/v/t62.7118-24/" + img.id + ".enc?mms3=true"),
+			DirectPath: proto.String("/v/t62.7118-24/" + img.id + ".enc"),
+			FileSHA256: img.sha,
+		}}
+
+		mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+		if err := store.StoreMessage(
+			img.id, chat, "someone", "", ingestedAt, false,
+			mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		); err != nil {
+			t.Fatalf("StoreMessage(%s) = %v", img.id, err)
+		}
+
+		gotType, gotName, _, _, _, gotSHA, _, _, err := store.GetMediaInfo(img.id, chat)
+		if err != nil {
+			t.Fatalf("GetMediaInfo(%s) = %v", img.id, err)
+		}
+
+		name := mediaFileName(gotType, gotName, img.id, gotSHA)
+		if !strings.HasSuffix(name, ".jpg") {
+			t.Errorf("name for %s = %q, want a .jpg", img.id, name)
+		}
+		if other, seen := names[name]; seen {
+			t.Fatalf("messages %s and %s both resolve to %q", other, img.id, name)
+		}
+		names[name] = img.id
+	}
+}
+
+func TestMediaFileName(t *testing.T) {
+	sha := []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa}
+
+	tests := []struct {
+		name      string
+		mediaType string
+		filename  string
+		messageID string
+		sha       []byte
+		want      string
+	}{
+		{"image", "image", "", "3A9F1C2B", sha, "image_1122334455667788.jpg"},
+		{"video", "video", "", "3A9F1C2B", sha, "video_1122334455667788.mp4"},
+		{"audio", "audio", "", "3A9F1C2B", sha, "audio_1122334455667788.ogg"},
+		{"document keeps the sender name", "document", "Regolamento.pdf", "3A9F1C2B", sha, "Regolamento_1122334455667788.pdf"},
+		{"document without a name", "document", "", "3A9F1C2B", sha, "document_1122334455667788"},
+		{"document path is stripped", "document", `C:\Users\mister\Regolamento.pdf`, "3A9F1C2B", sha, "Regolamento_1122334455667788.pdf"},
+		{"falls back to the message id", "image", "", "3A9F1C2B", nil, "image_3A9F1C2B.jpg"},
+		{"sanitizes the message id", "image", "", "../../etc/passwd", nil, "image_etcpasswd.jpg"},
+		{"nothing to name it with", "image", "", "", nil, "image_unknown.jpg"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := mediaFileName(tt.mediaType, tt.filename, tt.messageID, tt.sha); got != tt.want {
+				t.Errorf("mediaFileName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMediaTokenHandlesAShortHash(t *testing.T) {
+	// Rows seeded before file_sha256 was reliably populated can hold a stub.
+	if got := mediaFileName("image", "", "3A9F1C2B", []byte{0x02}); got != "image_02.jpg" {
+		t.Errorf("mediaFileName() = %q, want %q", got, "image_02.jpg")
 	}
 }

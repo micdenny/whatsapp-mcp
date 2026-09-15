@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -481,31 +482,32 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 	msg = unwrapMessage(msg)
 
+	// Only document messages carry a filename of their own. The other media
+	// types get their on-disk name in downloadMedia, derived per message:
+	// naming them here would mean a clock-based name, and a history sync
+	// processes dozens of messages within the same second.
+
 	// Check for image message
 	if img := msg.GetImageMessage(); img != nil {
-		return "image", "image_" + time.Now().Format("20060102_150405") + ".jpg",
+		return "image", "",
 			img.GetURL(), img.GetDirectPath(), img.GetMediaKey(), img.GetFileSHA256(), img.GetFileEncSHA256(), img.GetFileLength()
 	}
 
 	// Check for video message
 	if vid := msg.GetVideoMessage(); vid != nil {
-		return "video", "video_" + time.Now().Format("20060102_150405") + ".mp4",
+		return "video", "",
 			vid.GetURL(), vid.GetDirectPath(), vid.GetMediaKey(), vid.GetFileSHA256(), vid.GetFileEncSHA256(), vid.GetFileLength()
 	}
 
 	// Check for audio message
 	if aud := msg.GetAudioMessage(); aud != nil {
-		return "audio", "audio_" + time.Now().Format("20060102_150405") + ".ogg",
+		return "audio", "",
 			aud.GetURL(), aud.GetDirectPath(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
 	}
 
 	// Check for document message
 	if doc := msg.GetDocumentMessage(); doc != nil {
-		filename := doc.GetFileName()
-		if filename == "" {
-			filename = "document_" + time.Now().Format("20060102_150405")
-		}
-		return "document", filename,
+		return "document", doc.GetFileName(),
 			doc.GetURL(), doc.GetDirectPath(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
 	}
 
@@ -710,6 +712,61 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 	return d.MediaType
 }
 
+// Extensions for the media types that arrive without a filename of their own.
+var mediaExtensions = map[string]string{
+	"image": ".jpg",
+	"video": ".mp4",
+	"audio": ".ogg",
+}
+
+// mediaToken returns a short identifier that is stable for a given message and
+// distinct between messages: the content hash when the store has one, the
+// message ID otherwise. Names built on it can be reused across downloads
+// without ever handing back another message's file.
+func mediaToken(messageID string, fileSHA256 []byte) string {
+	if len(fileSHA256) > 0 {
+		digest := hex.EncodeToString(fileSHA256)
+		if len(digest) > 16 {
+			digest = digest[:16]
+		}
+		return digest
+	}
+
+	var token strings.Builder
+	for _, r := range messageID {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			token.WriteRune(r)
+		}
+		if token.Len() >= 32 {
+			break
+		}
+	}
+	if token.Len() == 0 {
+		return "unknown"
+	}
+	return token.String()
+}
+
+// mediaFileName builds the on-disk name for one media message. Documents keep
+// the sender's filename because it means something to the user, but every name
+// carries the message's token: two different PDFs both called "Regolamento.pdf"
+// in the same chat would otherwise land on the same path.
+func mediaFileName(mediaType, senderFilename, messageID string, fileSHA256 []byte) string {
+	token := mediaToken(messageID, fileSHA256)
+
+	base := filepath.Base(strings.ReplaceAll(senderFilename, `\`, "/"))
+	if mediaType != "document" || base == "." || base == ".." || base == "/" || base == "" {
+		prefix := mediaType
+		if prefix == "" {
+			prefix = "file"
+		}
+		return prefix + "_" + token + mediaExtensions[mediaType]
+	}
+
+	ext := filepath.Ext(base)
+	return strings.TrimSuffix(base, ext) + "_" + token + ext
+}
+
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message
@@ -747,14 +804,11 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file.
-	// Document messages carry a sender-supplied filename, so strip any
-	// directory components before using it as a path.
-	safeName := filepath.Base(strings.ReplaceAll(filename, `\`, "/"))
-	if safeName == "." || safeName == ".." || safeName == "/" || safeName == "" {
-		safeName = "file_" + time.Now().Format("20060102_150405")
-	}
-	localPath = fmt.Sprintf("%s/%s", chatDir, safeName)
+	// Name the file here rather than at ingest: this is the first point that
+	// knows which message is being downloaded, and the name has to be unique
+	// per message for the os.Stat shortcut below to be safe.
+	filename = mediaFileName(mediaType, filename, messageID, fileSHA256)
+	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
