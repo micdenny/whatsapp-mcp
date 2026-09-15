@@ -4,3 +4,6 @@ whatsapp.log
 *.db.old
 *.log
 whatsapp-bridge/whatsapp-bridge.exe
+*.db.bak-*
+whatsapp-bridge/store/
+whatsapp-bridge/whatsapp-bridge.exe.prev*
