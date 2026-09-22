@@ -11,5 +11,5 @@ if not exist "whatsapp-bridge.exe" (
     pause
     exit /b 1
 )
-whatsapp-bridge.exe
+"%~dp0whatsapp-bridge\whatsapp-bridge.exe"
 pause
