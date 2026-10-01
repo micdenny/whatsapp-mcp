@@ -1,3 +1,7 @@
+import os
+import sys
+import threading
+import time
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -279,6 +283,111 @@ def request_history(
         chat_jid, before_message_id, before_date, count, wait_seconds
     )
 
+def _windows_launcher_pid() -> int:
+    """PID of the process that started the server, skipping the venv launcher.
+
+    On Windows .venv\\Scripts\\python.exe is a small launcher that starts the
+    base interpreter as its own child and then just waits for it. Our direct
+    parent is therefore that launcher, which outlives whatever started it; the
+    process worth watching is the one above it (uv, or the MCP client).
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    parent_pid = os.getppid()
+    if os.path.normcase(sys.executable) == os.path.normcase(sys._base_executable):
+        return parent_pid  # not running from a venv: no launcher in between
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.QueryFullProcessImageNameW.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, parent_pid)
+    if not handle:
+        return parent_pid
+    try:
+        size = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return parent_pid
+    finally:
+        kernel32.CloseHandle(handle)
+    if os.path.normcase(buffer.value) != os.path.normcase(sys.executable):
+        return parent_pid
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    TH32CS_SNAPPROCESS = 0x2
+    INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    kernel32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+    kernel32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot == INVALID_HANDLE_VALUE:
+        return parent_pid
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        found = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while found:
+            if entry.th32ProcessID == parent_pid:
+                return entry.th32ParentProcessID
+            found = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return parent_pid
+
+
+def exit_with_parent() -> None:
+    """Terminate this process as soon as the process that launched it is gone.
+
+    On Windows the stdio transport of mcp 1.6 does not return when stdin hits
+    EOF: the event loop just idles. A client that kills its `uv run main.py`
+    therefore leaves this server behind for good, one per past session.
+    Waiting on the launcher's handle catches that without polling. Elsewhere we
+    poll for the reparenting that follows the parent's death.
+    """
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        SYNCHRONIZE = 0x00100000
+        INFINITE = 0xFFFFFFFF
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        launcher_pid = _windows_launcher_pid()
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, launcher_pid)
+        if not handle:
+            print(f"Cannot watch launcher process {launcher_pid}", file=sys.stderr)
+            return
+
+        def wait_for_parent() -> None:
+            kernel32.WaitForSingleObject(handle, INFINITE)
+            os._exit(0)
+    else:
+        parent_pid = os.getppid()
+        def wait_for_parent() -> None:
+            while os.getppid() == parent_pid:
+                time.sleep(2)
+            os._exit(0)
+
+    threading.Thread(target=wait_for_parent, name="parent-watchdog", daemon=True).start()
+
+
 if __name__ == "__main__":
+    exit_with_parent()
     # Initialize and run the server
     mcp.run(transport='stdio')
