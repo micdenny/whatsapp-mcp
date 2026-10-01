@@ -105,6 +105,51 @@ class Chat:
         """Determine if chat is a group based on JID pattern."""
         return self.jid.endswith("@g.us")
 
+
+def _chat_select(include_last_message: bool = True) -> str:
+    """SELECT ... FROM chats c, one row per chat, columns in Chat field order.
+
+    Callers append WHERE / ORDER BY / LIMIT and read rows with _chat_from_row().
+
+    The last message is the one whose timestamp equals chats.last_message_time.
+    Several messages can share that timestamp (a document and its caption, an
+    album), so the join alone would repeat the chat once per message: GROUP BY
+    keeps one row, and MAX(m.rowid) makes SQLite take the bare m.* columns from
+    the most recently stored of them. Without the join the message columns are
+    NULL, but they must still be selected - referencing m.* with no join is a
+    "no such column" error, which used to come back as an empty result.
+    """
+    if not include_last_message:
+        return """
+            SELECT c.jid, c.name, c.last_message_time,
+                   NULL AS last_message, NULL AS last_sender, NULL AS last_is_from_me
+            FROM chats c
+        """
+    return """
+        SELECT c.jid, c.name, c.last_message_time,
+               m.content AS last_message, m.sender AS last_sender,
+               m.is_from_me AS last_is_from_me, MAX(m.rowid)
+        FROM chats c
+        LEFT JOIN messages m ON c.jid = m.chat_jid
+            AND c.last_message_time = m.timestamp
+    """
+
+
+def _chat_group_by(include_last_message: bool = True) -> str:
+    """The GROUP BY that goes with _chat_select(), placed after any WHERE."""
+    return "GROUP BY c.jid" if include_last_message else ""
+
+
+def _chat_from_row(row) -> Chat:
+    return Chat(
+        jid=row[0],
+        name=row[1],
+        last_message_time=datetime.fromisoformat(row[2]) if row[2] else None,
+        last_message=row[3],
+        last_sender=row[4],
+        last_is_from_me=row[5]
+    )
+
 @dataclass
 class Contact:
     phone_number: str
@@ -398,59 +443,26 @@ def list_chats(
         conn = _connect()
         cursor = conn.cursor()
         
-        # Build base query
-        query_parts = ["""
-            SELECT 
-                chats.jid,
-                chats.name,
-                chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
-            FROM chats
-        """]
-        
-        if include_last_message:
-            query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid 
-                AND chats.last_message_time = messages.timestamp
-            """)
-            
-        where_clauses = []
+        query_parts = [_chat_select(include_last_message)]
         params = []
-        
+
         if query:
-            where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
+            query_parts.append("WHERE (LOWER(c.name) LIKE LOWER(?) OR c.jid LIKE ?)")
             params.extend([f"%{query}%", f"%{query}%"])
-            
-        if where_clauses:
-            query_parts.append("WHERE " + " AND ".join(where_clauses))
-            
+
+        query_parts.append(_chat_group_by(include_last_message))
+
         # Add sorting
-        order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
+        order_by = "c.last_message_time DESC" if sort_by == "last_active" else "c.name"
         query_parts.append(f"ORDER BY {order_by}")
-        
+
         # Add pagination
         offset = (page ) * limit
         query_parts.append("LIMIT ? OFFSET ?")
         params.extend([limit, offset])
-        
+
         cursor.execute(" ".join(query_parts), tuple(params))
-        chats = cursor.fetchall()
-        
-        result = []
-        for chat_data in chats:
-            chat = Chat(
-                jid=chat_data[0],
-                name=chat_data[1],
-                last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
-                last_message=chat_data[3],
-                last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
-            )
-            result.append(chat)
-            
-        return result
+        return [_chat_from_row(row) for row in cursor.fetchall()]
         
     except sqlite3.Error as e:
         print(f"Database error: {e}", file=sys.stderr)
@@ -552,36 +564,14 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         conn = _connect()
         cursor = conn.cursor()
         
-        cursor.execute("""
-            SELECT DISTINCT
-                c.jid,
-                c.name,
-                c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
-            FROM chats c
-            JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+        cursor.execute(_chat_select() + """
+            WHERE c.jid = ?
+               OR c.jid IN (SELECT chat_jid FROM messages WHERE sender = ?)
+        """ + _chat_group_by() + """
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
         """, (jid, jid, limit, page * limit))
-        
-        chats = cursor.fetchall()
-        
-        result = []
-        for chat_data in chats:
-            chat = Chat(
-                jid=chat_data[0],
-                name=chat_data[1],
-                last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
-                last_message=chat_data[3],
-                last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
-            )
-            result.append(chat)
-            
-        return result
+        return [_chat_from_row(row) for row in cursor.fetchall()]
         
     except sqlite3.Error as e:
         print(f"Database error: {e}", file=sys.stderr)
@@ -646,39 +636,16 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         conn = _connect()
         cursor = conn.cursor()
         
-        query = """
-            SELECT 
-                c.jid,
-                c.name,
-                c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
-            FROM chats c
-        """
-        
-        if include_last_message:
-            query += """
-                LEFT JOIN messages m ON c.jid = m.chat_jid 
-                AND c.last_message_time = m.timestamp
-            """
-            
-        query += " WHERE c.jid = ?"
-        
+        query = (_chat_select(include_last_message) + " WHERE c.jid = ? "
+                 + _chat_group_by(include_last_message))
+
         cursor.execute(query, (chat_jid,))
         chat_data = cursor.fetchone()
-        
+
         if not chat_data:
             return None
-            
-        return Chat(
-            jid=chat_data[0],
-            name=chat_data[1],
-            last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
-            last_message=chat_data[3],
-            last_sender=chat_data[4],
-            last_is_from_me=chat_data[5]
-        )
+
+        return _chat_from_row(chat_data)
         
     except sqlite3.Error as e:
         print(f"Database error: {e}", file=sys.stderr)
@@ -694,34 +661,18 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         conn = _connect()
         cursor = conn.cursor()
         
-        cursor.execute("""
-            SELECT 
-                c.jid,
-                c.name,
-                c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
-            FROM chats c
-            LEFT JOIN messages m ON c.jid = m.chat_jid 
-                AND c.last_message_time = m.timestamp
+        cursor.execute(_chat_select() + """
             WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+        """ + _chat_group_by() + """
             LIMIT 1
         """, (f"%{sender_phone_number}%",))
-        
+
         chat_data = cursor.fetchone()
-        
+
         if not chat_data:
             return None
-            
-        return Chat(
-            jid=chat_data[0],
-            name=chat_data[1],
-            last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
-            last_message=chat_data[3],
-            last_sender=chat_data[4],
-            last_is_from_me=chat_data[5]
-        )
+
+        return _chat_from_row(chat_data)
         
     except sqlite3.Error as e:
         print(f"Database error: {e}", file=sys.stderr)
